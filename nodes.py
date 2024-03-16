@@ -1,3 +1,5 @@
+import types
+import datetime
 import torch
 
 import os
@@ -30,7 +32,7 @@ import comfy.clip_vision
 import comfy.model_management
 from comfy.cli_args import args
 
-import importlib
+import importlib, importlib.util
 
 import folder_paths
 import latent_preview
@@ -1809,6 +1811,8 @@ NODE_CLASS_MAPPINGS = {
     "LoraLoaderModelOnly": LoraLoaderModelOnly,
 }
 
+BASENODE_NAMES = frozenset(NODE_CLASS_MAPPINGS.keys())
+
 NODE_DISPLAY_NAME_MAPPINGS = {
     # Sampling
     "KSampler": "KSampler",
@@ -1870,45 +1874,74 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
 EXTENSION_WEB_DIRS = {}
 
-def load_custom_node(module_path, ignore=set()):
+def load_custom_node(module_path, ignore=set(), reload=False):
     module_name = os.path.basename(module_path)
     if os.path.isfile(module_path):
-        sp = os.path.splitext(module_path)
-        module_name = sp[0]
-    try:
-        if os.path.isfile(module_path):
-            module_spec = importlib.util.spec_from_file_location(module_name, module_path)
-            module_dir = os.path.split(module_path)[0]
-        else:
-            module_spec = importlib.util.spec_from_file_location(module_name, os.path.join(module_path, "__init__.py"))
-            module_dir = module_path
+        module_name = os.path.splitext(module_name)[0]
+        module_dir = os.path.split(module_path)[0]
+    else:
+        module_dir = module_path
+        module_path = os.path.join(module_path, "__init__.py")
 
+    module = sys.modules.get(module_name)
+    if module is None:
+        reload = False
+    elif not reload:
+        logging.warning(f"{module_path} is already imported, skipping", e)
+        return False
+    
+    if reload and not any(
+        datetime.datetime.fromtimestamp(os.path.getmtime(sys.modules[name].__file__)) > ts
+        for name, ts in module.__modules):
+        return None
+    
+    try:
+        if reload:
+            # First, reload submodules 
+            for name, _ts in module.__modules:
+                if name == module_name:
+                    continue # root loaded bellow
+                mod = sys.modules[name]
+                logging.info(f'{module_name}: reloading {mod} ({mod.__file__})')
+                mod.__spec__.loader.exec_module(mod)
+        module_spec = importlib.util.spec_from_file_location(module_name, module_path)
         module = importlib.util.module_from_spec(module_spec)
         sys.modules[module_name] = module
         module_spec.loader.exec_module(module)
-
-        if hasattr(module, "WEB_DIRECTORY") and getattr(module, "WEB_DIRECTORY") is not None:
-            web_dir = os.path.abspath(os.path.join(module_dir, getattr(module, "WEB_DIRECTORY")))
-            if os.path.isdir(web_dir):
-                EXTENSION_WEB_DIRS[module_name] = web_dir
-
-        if hasattr(module, "NODE_CLASS_MAPPINGS") and getattr(module, "NODE_CLASS_MAPPINGS") is not None:
-            for name in module.NODE_CLASS_MAPPINGS:
-                if name not in ignore:
-                    NODE_CLASS_MAPPINGS[name] = module.NODE_CLASS_MAPPINGS[name]
-            if hasattr(module, "NODE_DISPLAY_NAME_MAPPINGS") and getattr(module, "NODE_DISPLAY_NAME_MAPPINGS") is not None:
-                NODE_DISPLAY_NAME_MAPPINGS.update(module.NODE_DISPLAY_NAME_MAPPINGS)
-            return True
-        else:
-            logging.warning(f"Skip {module_path} module for custom nodes due to the lack of NODE_CLASS_MAPPINGS.")
-            return False
     except Exception as e:
+        sys.modules.pop(module_name, None) 
         logging.warning(traceback.format_exc())
         logging.warning(f"Cannot import {module_path} module for custom nodes: {e}")
         return False
 
-def load_custom_nodes():
-    base_node_names = set(NODE_CLASS_MAPPINGS.keys())
+    if args.auto_reload:
+        # Get the list of modules to watch for reloading
+        now = datetime.datetime.now()
+        modules = [(k, now) 
+                    for k,v in sys.modules.items() 
+                    if k.startswith(module_name) and getattr(v, '__file__', None) is not None]
+        modules.sort(key=lambda x: -x[0].count('.'))
+        module.__modules = modules
+    
+    if getattr(module, "WEB_DIRECTORY", None) is not None:
+        web_dir = os.path.abspath(os.path.join(module_dir, getattr(module, "WEB_DIRECTORY")))
+        if os.path.isdir(web_dir):
+            EXTENSION_WEB_DIRS[module_name] = web_dir
+
+    if getattr(module, "NODE_CLASS_MAPPINGS", None) is not None:
+        nodes = []
+        for name in module.NODE_CLASS_MAPPINGS:
+            if name not in ignore:
+                NODE_CLASS_MAPPINGS[name] = module.NODE_CLASS_MAPPINGS[name]
+                nodes.append(name)
+        if getattr(module, "NODE_DISPLAY_NAME_MAPPINGS", None) is not None:
+            NODE_DISPLAY_NAME_MAPPINGS.update(module.NODE_DISPLAY_NAME_MAPPINGS)
+        return nodes
+    else:
+        logging.warning(f"Skip {module_path} module for custom nodes due to the lack of NODE_CLASS_MAPPINGS.")
+        return False
+
+def load_custom_nodes(reload=False):
     node_paths = folder_paths.get_folder_paths("custom_nodes")
     node_import_times = []
     for custom_node_path in node_paths:
@@ -1921,20 +1954,25 @@ def load_custom_nodes():
             if os.path.isfile(module_path) and os.path.splitext(module_path)[1] != ".py": continue
             if module_path.endswith(".disabled"): continue
             time_before = time.perf_counter()
-            success = load_custom_node(module_path, base_node_names)
-            node_import_times.append((time.perf_counter() - time_before, module_path, success))
+            nodes = load_custom_node(module_path, BASENODE_NAMES, reload=reload)
+            if nodes is None: continue # skipped reload
+            node_import_times.append((time.perf_counter() - time_before, module_path, nodes))
 
+    nodes = []
     if len(node_import_times) > 0:
         logging.info("\nImport times for custom nodes:")
         for n in sorted(node_import_times):
-            if n[2]:
-                import_message = ""
+            ns = n[2]
+            if ns:
+                import_message = f" ({len(ns)} nodes)"
+                nodes.extend(ns)
             else:
                 import_message = " (IMPORT FAILED)"
             logging.info("{:6.1f} seconds{}: {}".format(n[0], import_message, n[1]))
         logging.info("")
+    return nodes
 
-def init_custom_nodes():
+def init_custom_nodes(reload=False):
     extras_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "comfy_extras")
     extras_files = [
         "nodes_latent.py",
@@ -1966,12 +2004,18 @@ def init_custom_nodes():
         "nodes_differential_diffusion.py",
     ]
 
+    nodes = []
     import_failed = []
     for node_file in extras_files:
-        if not load_custom_node(os.path.join(extras_dir, node_file)):
+        ns = load_custom_node(os.path.join(extras_dir, node_file), reload=reload)
+        if ns: 
+            nodes.extend(ns)
+        elif ns is None:
+            continue
+        else:
             import_failed.append(node_file)
 
-    load_custom_nodes()
+    nodes.extend(load_custom_nodes(reload=reload))
 
     if len(import_failed) > 0:
         logging.warning("WARNING: some comfy_extras/ nodes did not import correctly. This may be because they are missing some dependencies.\n")
@@ -1983,3 +2027,4 @@ def init_custom_nodes():
         else:
             logging.warning("Please do a: pip install -r requirements.txt")
         logging.warning("")
+    return nodes

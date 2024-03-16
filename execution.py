@@ -215,11 +215,15 @@ def recursive_will_execute(prompt, outputs, current_item, memo={}):
     memo[unique_id] = will_execute + [unique_id]
     return memo[unique_id]
 
-def recursive_output_delete_if_changed(prompt, old_prompt, outputs, current_item):
+def recursive_output_delete_if_changed(prompt, old_prompt, outputs, current_item, reloaded_modules=()):
     unique_id = current_item
     inputs = prompt[unique_id]['inputs']
     class_type = prompt[unique_id]['class_type']
     class_def = nodes.NODE_CLASS_MAPPINGS[class_type]
+
+    if class_type in reloaded_modules:
+        outputs.pop(unique_id, None)
+        return True
 
     is_changed_old = ''
     is_changed = ''
@@ -255,7 +259,7 @@ def recursive_output_delete_if_changed(prompt, old_prompt, outputs, current_item
                     input_unique_id = input_data[0]
                     output_index = input_data[1]
                     if input_unique_id in outputs:
-                        to_delete = recursive_output_delete_if_changed(prompt, old_prompt, outputs, input_unique_id)
+                        to_delete = recursive_output_delete_if_changed(prompt, old_prompt, outputs, input_unique_id, reloaded_modules)
                     else:
                         to_delete = True
                     if to_delete:
@@ -264,8 +268,7 @@ def recursive_output_delete_if_changed(prompt, old_prompt, outputs, current_item
             to_delete = True
 
     if to_delete:
-        d = outputs.pop(unique_id)
-        del d
+        outputs.pop(unique_id)
     return to_delete
 
 class PromptExecutor:
@@ -334,6 +337,7 @@ class PromptExecutor:
             self.server.client_id = extra_data["client_id"]
         else:
             self.server.client_id = None
+        reloaded_modules = set(extra_data.get('reloaded_modules', ()))
 
         self.status_messages = []
         self.add_message("execution_start", { "prompt_id": prompt_id}, broadcast=False)
@@ -360,7 +364,7 @@ class PromptExecutor:
                 del d
 
             for x in prompt:
-                recursive_output_delete_if_changed(prompt, self.old_prompt, self.outputs, x)
+                recursive_output_delete_if_changed(prompt, self.old_prompt, self.outputs, x, reloaded_modules)
 
             current_outputs = set(self.outputs.keys())
             for x in list(self.outputs_ui.keys()):

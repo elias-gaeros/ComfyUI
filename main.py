@@ -105,10 +105,11 @@ def prompt_worker(q, server):
         if queue_item is not None:
             item, item_id = queue_item
             execution_start_time = time.perf_counter()
-            prompt_id = item[1]
+            _, prompt_id, prompt, extra_data, execute_output = item
             server.last_prompt_id = prompt_id
-
-            e.execute(item[2], prompt_id, item[3], item[4])
+            if args.auto_reload:
+                extra_data["reloaded_modules"] = init_custom_nodes(reload=True)
+            e.execute(prompt, prompt_id, extra_data, execute_output)
             need_gc = True
             q.task_done(item_id,
                         e.outputs_ui,
