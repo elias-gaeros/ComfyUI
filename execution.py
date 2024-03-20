@@ -351,17 +351,20 @@ class PromptExecutor:
             for o in to_delete:
                 d = self.outputs.pop(o)
                 del d
-            to_delete = []
-            for o in self.object_storage:
-                if o[0] not in prompt:
-                    to_delete += [o]
-                else:
-                    p = prompt[o[0]]
-                    if o[1] != p['class_type']:
+            if reloaded_modules:
+                self.object_storage = {}
+            else:
+                to_delete = []
+                for o in self.object_storage:
+                    if o[0] not in prompt:
                         to_delete += [o]
-            for o in to_delete:
-                d = self.object_storage.pop(o)
-                del d
+                    else:
+                        p = prompt[o[0]]
+                        if o[1] != p['class_type']:
+                            to_delete += [o]
+                for o in to_delete:
+                    d = self.object_storage.pop(o)
+                    del d
 
             for x in prompt:
                 recursive_output_delete_if_changed(prompt, self.old_prompt, self.outputs, x, reloaded_modules)
